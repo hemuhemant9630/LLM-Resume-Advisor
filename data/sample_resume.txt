@@ -1,0 +1,17 @@
+
+John Doe
+Email: john@example.com
+Phone: 123-456-7890
+
+Education:
+B.Tech in Computer Science - XYZ University
+
+Skills:
+Python, Machine Learning, SQL, HTML/CSS, Git
+
+Experience:
+Intern - Data Science at ABC Corp
+
+Projects:
+- Customer Churn Prediction
+- Resume Parser using NLP
