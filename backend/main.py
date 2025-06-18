@@ -1,12 +1,24 @@
-from fastapi import FastAPI, UploadFile, File
+from preprocessing import clean_text
+from parser import parse_resume_sections
+from models import ResumeAnalysis
+from llm_analyser import analyze_with_llm
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import fitz  # PyMuPDF
 import os
-import requests
+import logging
 from dotenv import load_dotenv
+import tempfile
+from pathlib import Path
+import docx
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
-api_key = os.getenv("OPENROUTER_API_KEY")
+if not os.getenv("OPENROUTER_API_KEY"):
+    raise ValueError("OPENROUTER_API_KEY environment variable is not set")
 
 app = FastAPI()
 
@@ -18,46 +30,79 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.post("/analyze-resume/")
+def extract_text_from_pdf(file_path: str) -> str:
+    """Extract text from a PDF file."""
+    try:
+        doc = fitz.open(file_path)
+        text = " ".join([page.get_text() for page in doc])
+        doc.close()
+        return text
+    except Exception as e:
+        logger.error(f"Error extracting text from PDF: {str(e)}")
+        raise ValueError(f"Failed to extract text from PDF: {str(e)}")
+
+def extract_text_from_docx(file_path: str) -> str:
+    """Extract text from a DOCX file."""
+    try:
+        doc = docx.Document(file_path)
+        text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
+        return text
+    except Exception as e:
+        logger.error(f"Error extracting text from DOCX: {str(e)}")
+        raise ValueError(f"Failed to extract text from DOCX: {str(e)}")
+
+@app.post("/analyze-resume/", response_model=ResumeAnalysis)
 async def analyze_resume(file: UploadFile = File(...)):
-    contents = await file.read()
-    with open("temp_resume.pdf", "wb") as f:
-        f.write(contents)
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
 
-    doc = fitz.open("temp_resume.pdf")
-    text = " ".join([page.get_text() for page in doc])
-
-    prompt = f"""
-You are a career coach AI. Analyze the resume below and respond with:
-
-1. Top 3 suitable job roles
-2. Missing skill gaps
-3. Recommended online courses (mention platforms)
-4. 3 resume improvement tips
-
-Resume:
-{text}
-"""
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "http://localhost:8501",  # IMPORTANT for OpenRouter!
-        "X-Title": "LLM Resume Advisor"
-    }
-
-    body = {
-        "model": "deepseek-chat",
-        "messages": [
-            {"role": "user", "content": prompt}
-        ]
-    }
+    file_extension = Path(file.filename).suffix.lower()
+    if file_extension not in ['.pdf', '.docx', '.txt']:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file format. Only PDF, DOCX, and TXT files are supported"
+        )
 
     try:
-        response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body)
-        response.raise_for_status()
-        reply = response.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        reply = f"Error: {e}"
+        # Create a temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
+            contents = await file.read()
+            temp_file.write(contents)
+            temp_file.flush()
+            
+            # Extract text based on file type
+            try:
+                if file_extension == '.pdf':
+                    text = extract_text_from_pdf(temp_file.name)
+                elif file_extension == '.docx':
+                    text = extract_text_from_docx(temp_file.name)
+                else:  # .txt
+                    text = contents.decode('utf-8', errors='ignore')
+            finally:
+                # Clean up the temporary file
+                try:
+                    os.unlink(temp_file.name)
+                except Exception as e:
+                    logger.warning(f"Failed to delete temporary file: {str(e)}")
 
-    return {"gpt_analysis": reply}
+        # Process the resume
+        logger.info("Cleaning extracted text...")
+        cleaned_text = clean_text(text)
+        
+        logger.info("Parsing resume sections...")
+        sections = parse_resume_sections(cleaned_text)
+        
+        logger.info("Analyzing resume with LLM...")
+        analysis = analyze_with_llm(sections)
+        
+        return ResumeAnalysis(**analysis)
+
+    except ValueError as e:
+        logger.error(f"Value error: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while processing the resume"
+        )
